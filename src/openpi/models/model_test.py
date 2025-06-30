@@ -23,6 +23,16 @@ def test_pi0_model():
     actions = nnx_utils.module_jit(model.sample_actions)(key, obs, num_steps=10)
     assert actions.shape == (batch_size, model.action_horizon, model.action_dim)
 
+    realtime = nnx_utils.module_jit(model.realtime_actions)(
+        key,
+        obs,
+        act,
+        num_steps=5,
+        inference_delay=1,
+        prefix_attention_horizon=5,
+    )
+    assert realtime.shape == (batch_size, model.action_horizon, model.action_dim)
+
 
 def test_pi0_lora_model():
     key = jax.random.key(0)

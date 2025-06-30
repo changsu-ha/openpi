@@ -1,5 +1,7 @@
 import dataclasses
+import functools
 import logging
+from typing import Literal
 
 import einops
 import flax.nnx as nnx
@@ -62,6 +64,26 @@ def posemb_sincos(
         precision=jax.lax.Precision.HIGHEST,
     )
     return jnp.concatenate([jnp.sin(sinusoid_input), jnp.cos(sinusoid_input)], axis=-1)
+
+
+# --- Real-time chunking utilities ------------------------------------------------
+PrefixAttentionSchedule = Literal["linear", "exp", "ones", "zeros"]
+
+
+def get_prefix_weights(start: int, end: int, total: int, schedule: PrefixAttentionSchedule) -> jax.Array:
+    """Computes the prefix attention weights used for real-time chunking."""
+    start = jnp.minimum(start, end)
+    if schedule == "ones":
+        w = jnp.ones(total)
+    elif schedule == "zeros":
+        w = (jnp.arange(total) < start).astype(jnp.float32)
+    elif schedule in ("linear", "exp"):
+        w = jnp.clip((start - 1 - jnp.arange(total)) / (end - start + 1) + 1, 0, 1)
+        if schedule == "exp":
+            w = w * jnp.expm1(w) / (jnp.e - 1)
+    else:
+        raise ValueError(f"Invalid schedule: {schedule}")
+    return jnp.where(jnp.arange(total) >= end, 0, w)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -319,6 +341,76 @@ class Pi0(_model.BaseModel):
         def cond(carry):
             x_t, time = carry
             # robust to floating-point error
+            return time >= -dt / 2
+
+        x_0, _ = jax.lax.while_loop(cond, step, (noise, 1.0))
+        return x_0
+
+    def realtime_actions(
+        self,
+        rng: at.KeyArrayLike,
+        observation: _model.Observation,
+        prev_action_chunk: _model.Actions,
+        *,
+        num_steps: int = 10,
+        inference_delay: int = 1,
+        prefix_attention_horizon: int = 8,
+        prefix_attention_schedule: PrefixAttentionSchedule = "exp",
+        max_guidance_weight: float = 10.0,
+    ) -> _model.Actions:
+        """Generates an action chunk using real-time chunking guidance."""
+        observation = _model.preprocess_observation(None, observation, train=False)
+        dt = -1.0 / num_steps
+        batch_size = observation.state.shape[0]
+
+        prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
+        prefix_attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask)
+        positions = jnp.cumsum(prefix_mask, axis=1) - 1
+        _, kv_cache = self.PaliGemma.llm([prefix_tokens, None], mask=prefix_attn_mask, positions=positions)
+
+        weights = get_prefix_weights(
+            inference_delay,
+            prefix_attention_horizon,
+            self.action_horizon,
+            prefix_attention_schedule,
+        )
+
+        def model_step(obs, x_t, time):
+            suffix_tokens, suffix_mask, suffix_ar_mask = self.embed_suffix(obs, x_t, jnp.broadcast_to(time, batch_size))
+            suffix_attn_mask = make_attn_mask(suffix_mask, suffix_ar_mask)
+            prefix_attn = einops.repeat(prefix_mask, "b p -> b s p", s=suffix_tokens.shape[1])
+            full_attn_mask = jnp.concatenate([prefix_attn, suffix_attn_mask], axis=-1)
+            pos = jnp.sum(prefix_mask, axis=-1)[:, None] + jnp.cumsum(suffix_mask, axis=-1) - 1
+            (p_out, s_out), _ = self.PaliGemma.llm(
+                [None, suffix_tokens], mask=full_attn_mask, positions=pos, kv_cache=kv_cache
+            )
+            assert p_out is None
+            return self.action_out_proj(s_out[:, -self.action_horizon :])
+
+        @functools.partial(jax.vmap, in_axes=(None, 0, 0, None))
+        def pinv_corrected_velocity(obs, x_t, y, time):
+            def denoiser(x_t_inner):
+                v_t_inner = model_step(obs, x_t_inner, time)
+                return x_t_inner + dt * v_t_inner, v_t_inner
+
+            x_next, vjp_fun, v_t_inner = jax.vjp(denoiser, x_t, has_aux=True)
+            error = (y - x_next) * weights[:, None]
+            pinv_correction = vjp_fun(error)[0]
+            t = 1.0 - time
+            inv_r2 = (t**2 + (1 - t) ** 2) / ((1 - t) ** 2)
+            c = jnp.nan_to_num((1 - t) / t, posinf=max_guidance_weight)
+            guidance_weight = jnp.minimum(c * inv_r2, max_guidance_weight)
+            return v_t_inner + guidance_weight * pinv_correction
+
+        noise = jax.random.normal(rng, (batch_size, self.action_horizon, self.action_dim))
+
+        def step(carry, _):
+            x_t, time = carry
+            v_t = pinv_corrected_velocity(observation, x_t, prev_action_chunk, time)
+            return (x_t + dt * v_t, time + dt), None
+
+        def cond(carry):
+            _, time = carry
             return time >= -dt / 2
 
         x_0, _ = jax.lax.while_loop(cond, step, (noise, 1.0))
